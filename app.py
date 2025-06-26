@@ -1,5 +1,5 @@
 # 📌 Install dependencies
-!pip install pdfplumber openpyxl pandas
+pip install pdfplumber openpyxl pandas
 
 import pdfplumber
 import pandas as pd

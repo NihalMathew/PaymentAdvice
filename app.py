@@ -30,17 +30,19 @@ def extract_debit(line):
 
 if uploaded_pdf:
     data = []
-    tds_map = {}
+    tds_map_signed = {}  # keep signed values for math
     seen_entries = set()
     last_invoice = None
 
     with pdfplumber.open(uploaded_pdf) as pdf:
         for page in pdf.pages:
-            lines = page.extract_text().split("\n")
+            text = page.extract_text() or ""
+            lines = text.split("\n")
             i = 0
             while i < len(lines):
                 tokens = lines[i].split()
 
+                # Main invoice entry
                 if len(tokens) >= 4 and is_invoice_no(tokens[1]):
                     doc_no, inv_no = tokens[0], tokens[1]
                     inv_amt = parse_signed_number(tokens[2])
@@ -64,13 +66,14 @@ if uploaded_pdf:
                             'Invoice Amount': inv_amt,
                             'GST Adjustment': 0.0,
                             'Payment Amount': pay_amt,
-                            'TDS': 0.0,
+                            'TDS_Signed': 0.0,     # keep signed in raw data
                             'Debit Note': debit_val,
                             'Status': status
                         })
                         seen_entries.add(key)
                     last_invoice = inv_no
 
+                # GST entry (paid/hold)
                 elif len(tokens) >= 3 and is_invoice_no(tokens[1]):
                     doc_no, inv_no = tokens[0], tokens[1]
                     pay_amt = parse_signed_number(tokens[2])
@@ -87,36 +90,46 @@ if uploaded_pdf:
                             'Invoice Number': inv_no,
                             'Invoice Date': inv_date,
                             'Invoice Amount': 0.0,
-                            'GST Adjustment': pay_amt,
+                            'GST Adjustment': pay_amt,  # signed GST adjustment
                             'Payment Amount': 0.0,
-                            'TDS': 0.0,
+                            'TDS_Signed': 0.0,
                             'Debit Note': 0.0,
                             'Status': status
                         })
                         seen_entries.add(key)
                     last_invoice = inv_no
 
+                # TDS line (capture signed value, once per invoice)
                 if "TDS Amount" in lines[i] and last_invoice:
-                    if last_invoice not in tds_map:
+                    if last_invoice not in tds_map_signed:
                         nums = [parse_signed_number(n) for n in lines[i].split() if re.search(r'\d', n)]
                         if nums:
-                            tds_map[last_invoice] = nums[0]
+                            tds_map_signed[last_invoice] = nums[0]
                 i += 1
 
+    # Build DataFrame
     df_all = pd.DataFrame(data)
-    df_all['TDS'] = df_all['Invoice Number'].map(tds_map).fillna(0)
 
+    # Map signed TDS to every row of that invoice for raw view
+    df_all['TDS_Signed'] = df_all['Invoice Number'].map(tds_map_signed).fillna(0.0)
+
+    # Aggregate to summary
     pivot_df = df_all.groupby(['Invoice Number'], as_index=False).agg({
         'Invoice Amount': 'max',
         'GST Adjustment': 'sum',
         'Payment Amount': 'sum',
-        'TDS': 'max',
+        'TDS_Signed': 'max',      # signed TDS for math if needed later
         'Debit Note': 'sum',
         'Invoice Date': 'first'
     })
 
+    # Final paid amount (unchanged): Payment + GST adjustments
     pivot_df['Final Paid Amount'] = pivot_df['Payment Amount'] + pivot_df['GST Adjustment']
 
+    # Display TDS as absolute value ONLY in the summary output
+    pivot_df['TDS'] = pivot_df['TDS_Signed'].abs()
+
+    # Final column order (with TDS positive)
     pivot_df = pivot_df[[
         'Invoice Number', 'Final Paid Amount', 'TDS',
         'Invoice Amount', 'GST Adjustment', 'Payment Amount', 'Debit Note', 'Invoice Date'
@@ -125,6 +138,7 @@ if uploaded_pdf:
     st.success("✅ Final Invoice Summary")
     st.dataframe(pivot_df)
 
+    # Excel: Summary shows TDS without sign; Raw Data keeps TDS_Signed for audit
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pivot_df.to_excel(writer, sheet_name='Final Summary', index=False)

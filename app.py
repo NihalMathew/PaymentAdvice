@@ -28,6 +28,30 @@ def extract_debit(line):
     match = re.search(r'Rs\.?([\d,]+\.\d{1,2})', line)
     return float(match.group(1).replace(',', '')) if match else 0.0
 
+def read_table(file):
+    """
+    Load CSV or Excel into a DataFrame with trimmed column names.
+    """
+    if file is None:
+        return None
+    # Try Excel first; if it fails, try CSV
+    try:
+        df = pd.read_excel(file)
+    except Exception:
+        file.seek(0)
+        df = pd.read_csv(file)
+    # Normalize columns: strip whitespace
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def normalize_invoice(s):
+    # Normalize invoice for joining: upper, strip spaces
+    return str(s).upper().strip().replace(' ', '')
+
+def normalize_state(s):
+    # Normalize state for joining: upper, collapse spaces
+    return re.sub(r'\s+', ' ', str(s).upper().strip())
+
 if uploaded_pdf:
     data = []
     tds_map_signed = {}  # keep signed values for math
@@ -129,19 +153,103 @@ if uploaded_pdf:
     # Display TDS as absolute value ONLY in the summary output
     pivot_df['TDS'] = pivot_df['TDS_Signed'].abs()
 
-    # Final column order (with TDS positive)
-    pivot_df = pivot_df[[
+    # Reorder (base, without Import Name yet)
+    base_cols = [
         'Invoice Number', 'Final Paid Amount', 'TDS',
         'Invoice Amount', 'GST Adjustment', 'Payment Amount', 'Debit Note', 'Invoice Date'
-    ]]
+    ]
+    pivot_df = pivot_df[base_cols].copy()
 
     st.success("✅ Final Invoice Summary")
     st.dataframe(pivot_df)
 
-    # Excel: Summary shows TDS without sign; Raw Data keeps TDS_Signed for audit
+    # ============== Optional Import Name enrichment ==============
+    st.markdown("---")
+    st.subheader("Optional: Add Import Name (via Ledger & State mapping)")
+    want_import = st.checkbox("Add 'Import Name' column using E‑Invoice Ledger and State Details?")
+
+    enriched_df = pivot_df.copy()
+
+    if want_import:
+        ledger_file = st.file_uploader(
+            "Upload E‑Invoice Ledger Report (must include 'Invoice Number' and 'Ship To (State)')",
+            type=["xlsx", "xls", "csv"], key="ledger"
+        )
+        state_map_file = st.file_uploader(
+            "Upload State Details (must include 'STATE NAME' and 'IMPORT NAME')",
+            type=["xlsx", "xls", "csv"], key="state"
+        )
+
+        if ledger_file and state_map_file:
+            # Read both tables
+            ledger_df = read_table(ledger_file)
+            state_df = read_table(state_map_file)
+
+            # Validate columns
+            ledger_required = {'Invoice Number', 'Ship To (State)'}
+            state_required = {'STATE NAME', 'IMPORT NAME'}
+            missing_ledger = ledger_required - set(ledger_df.columns)
+            missing_state = state_required - set(state_df.columns)
+
+            if missing_ledger:
+                st.error(f"Ledger file is missing columns: {missing_ledger}")
+            elif missing_state:
+                st.error(f"State Details file is missing columns: {missing_state}")
+            else:
+                # Normalize columns for joining
+                ledger_df = ledger_df.copy()
+                ledger_df['__INV_JOIN__'] = ledger_df['Invoice Number'].map(normalize_invoice)
+                ledger_df['__STATE_JOIN__'] = ledger_df['Ship To (State)'].map(normalize_state)
+
+                state_df = state_df.copy()
+                state_df['__STATE_JOIN__'] = state_df['STATE NAME'].map(normalize_state)
+                state_df = state_df[['__STATE_JOIN__', 'IMPORT NAME']].drop_duplicates()
+
+                enriched_df = enriched_df.copy()
+                enriched_df['__INV_JOIN__'] = enriched_df['Invoice Number'].map(normalize_invoice)
+
+                # Join 1: Invoice → State
+                tmp = pd.merge(
+                    enriched_df,
+                    ledger_df[['__INV_JOIN__', '__STATE_JOIN__']].drop_duplicates(),
+                    on='__INV_JOIN__',
+                    how='left'
+                )
+
+                # Join 2: State → Import Name
+                tmp = pd.merge(
+                    tmp,
+                    state_df,
+                    on='__STATE_JOIN__',
+                    how='left'
+                )
+
+                # Finalize
+                tmp.rename(columns={'IMPORT NAME': 'Import Name'}, inplace=True)
+                tmp.drop(columns=['__INV_JOIN__', '__STATE_JOIN__'], inplace=True)
+
+                # Place 'Import Name' right after 'Invoice Number'
+                cols_with_import = ['Invoice Number', 'Import Name'] + [c for c in base_cols if c != 'Invoice Number']
+                # Ensure no duplicates and keep existing if any collisions
+                cols_with_import = [c for i, c in enumerate(cols_with_import) if c not in cols_with_import[:i]]
+                enriched_df = tmp[cols_with_import]
+
+                # Basic diagnostics
+                matched = enriched_df['Import Name'].notna().sum()
+                total = len(enriched_df)
+                st.info(f"Matched Import Name for {matched} of {total} invoices.")
+
+                # Show enriched table
+                st.success("✅ Final Invoice Summary (with Import Name)")
+                st.dataframe(enriched_df)
+
+    # ============================ Export ============================
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pivot_df.to_excel(writer, sheet_name='Final Summary', index=False)
+        # If we enriched, write enriched_df; else write pivot_df
+        (enriched_df if want_import and 'Import Name' in enriched_df.columns else pivot_df)\
+            .to_excel(writer, sheet_name='Final Summary', index=False)
+        # Raw Data for audit (with signed TDS)
         df_all.to_excel(writer, sheet_name='Raw Data', index=False)
     output.seek(0)
 

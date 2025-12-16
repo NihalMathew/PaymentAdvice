@@ -47,7 +47,7 @@ def parse_signed_number(x):
     return 0.0
 
 def is_invoice_no(s):
-    return bool(re.match(r'^(R\d+|VCC[-/]?\w+)', s, re.IGNORECASE))
+    return bool(re.match(r'^(R\d+|UKM[-/]?\w+)', s, re.IGNORECASE))
 
 def is_date(s):
     return bool(re.match(r'\d{2}\.\d{2}\.\d{4}', s))

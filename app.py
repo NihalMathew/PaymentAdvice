@@ -81,7 +81,6 @@ if uploaded_pdf:
     if not validate_account_number_page1(uploaded_pdf, EXPECTED_ACCT):
         st.error(
             f"❌ Invalid Payment Advice file.\n\n"
-            f"This tool only accepts PDFs with 'Your A/c with us : {EXPECTED_ACCT}' on page 1."
         )
         st.stop()
 

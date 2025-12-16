@@ -4,10 +4,38 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="🧾 Payment Advice Parser v4.3", layout="wide")
-st.title("📄 Payment Advice PDF Parser v4.3")
+st.set_page_config(page_title="🧾 VCC Payment Advice Parser v4.3", layout="wide")
+st.title("📄 VCC Payment Advice PDF Parser v4.4")
 
 uploaded_pdf = st.file_uploader("Upload your Payment Advice PDF", type=["pdf"])
+
+# ✅ Account validation config (Page 1 only)
+EXPECTED_ACCT = "30305409"
+ACCT_REGEX = re.compile(r"Your\s*A/c\s*with\s*us\s*:\s*(\d+)", re.IGNORECASE)
+
+def validate_account_number_page1(pdf_file, expected_acct: str) -> bool:
+    """
+    Checks ONLY page 1 for 'Your A/c with us : <number>'.
+    Returns True if expected account number is found, else False.
+    """
+    try:
+        pdf_file.seek(0)
+        with pdfplumber.open(pdf_file) as pdf:
+            if len(pdf.pages) == 0:
+                return False
+            text = (pdf.pages[0].extract_text() or "")
+            m = ACCT_REGEX.search(text)
+            if not m:
+                return False
+            found = m.group(1).strip()
+            return found == expected_acct
+    except Exception:
+        return False
+    finally:
+        try:
+            pdf_file.seek(0)
+        except Exception:
+            pass
 
 def parse_signed_number(x):
     match = re.search(r'-?\d+(?:,\d{3})*(?:\.\d{1,2})?-?', str(x))
@@ -34,27 +62,31 @@ def read_table(file):
     """
     if file is None:
         return None
-    # Try Excel first; if it fails, try CSV
     try:
         df = pd.read_excel(file)
     except Exception:
         file.seek(0)
         df = pd.read_csv(file)
-    # Normalize columns: strip whitespace
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def normalize_invoice(s):
-    # Normalize invoice for joining: upper, strip spaces
     return str(s).upper().strip().replace(' ', '')
 
 def normalize_state(s):
-    # Normalize state for joining: upper, collapse spaces
     return re.sub(r'\s+', ' ', str(s).upper().strip())
 
 if uploaded_pdf:
+    # ✅ Gatekeeper check BEFORE any parsing (Page 1 only)
+    if not validate_account_number_page1(uploaded_pdf, EXPECTED_ACCT):
+        st.error(
+            f"❌ Invalid Payment Advice file.\n\n"
+            f"This tool only accepts PDFs with 'Your A/c with us : {EXPECTED_ACCT}' on page 1."
+        )
+        st.stop()
+
     data = []
-    tds_map_signed = {}  # keep signed values for math
+    tds_map_signed = {}
     seen_entries = set()
     last_invoice = None
 
@@ -73,15 +105,16 @@ if uploaded_pdf:
                     pay_amt = parse_signed_number(tokens[3])
                     status = "MAIN ENTRY"
                     inv_date = ""
-                    if i+1 < len(lines):
-                        date_tokens = lines[i+1].split()
+                    if i + 1 < len(lines):
+                        date_tokens = lines[i + 1].split()
                         if len(date_tokens) >= 2 and is_date(date_tokens[0]) and is_date(date_tokens[1]):
                             inv_date = date_tokens[1]
                             i += 1
                     debit_val = 0.0
-                    if i+1 < len(lines) and "Short payment" in lines[i+1]:
-                        debit_val = extract_debit(lines[i+1])
+                    if i + 1 < len(lines) and "Short payment" in lines[i + 1]:
+                        debit_val = extract_debit(lines[i + 1])
                         i += 1
+
                     key = (inv_no, pay_amt, status)
                     if key not in seen_entries:
                         data.append({
@@ -90,7 +123,7 @@ if uploaded_pdf:
                             'Invoice Amount': inv_amt,
                             'GST Adjustment': 0.0,
                             'Payment Amount': pay_amt,
-                            'TDS_Signed': 0.0,     # keep signed in raw data
+                            'TDS_Signed': 0.0,
                             'Debit Note': debit_val,
                             'Status': status
                         })
@@ -103,18 +136,19 @@ if uploaded_pdf:
                     pay_amt = parse_signed_number(tokens[2])
                     status = "GST PAID" if pay_amt > 0 else "GST HOLD"
                     inv_date = ""
-                    if i+1 < len(lines):
-                        date_tokens = lines[i+1].split()
+                    if i + 1 < len(lines):
+                        date_tokens = lines[i + 1].split()
                         if len(date_tokens) >= 2 and is_date(date_tokens[0]) and is_date(date_tokens[1]):
                             inv_date = date_tokens[1]
                             i += 1
+
                     key = (inv_no, pay_amt, status)
                     if key not in seen_entries:
                         data.append({
                             'Invoice Number': inv_no,
                             'Invoice Date': inv_date,
                             'Invoice Amount': 0.0,
-                            'GST Adjustment': pay_amt,  # signed GST adjustment
+                            'GST Adjustment': pay_amt,
                             'Payment Amount': 0.0,
                             'TDS_Signed': 0.0,
                             'Debit Note': 0.0,
@@ -129,6 +163,7 @@ if uploaded_pdf:
                         nums = [parse_signed_number(n) for n in lines[i].split() if re.search(r'\d', n)]
                         if nums:
                             tds_map_signed[last_invoice] = nums[0]
+
                 i += 1
 
     # Build DataFrame
@@ -142,12 +177,12 @@ if uploaded_pdf:
         'Invoice Amount': 'max',
         'GST Adjustment': 'sum',
         'Payment Amount': 'sum',
-        'TDS_Signed': 'max',      # signed TDS for math if needed later
+        'TDS_Signed': 'max',
         'Debit Note': 'sum',
         'Invoice Date': 'first'
     })
 
-    # Final paid amount (unchanged): Payment + GST adjustments
+    # Final paid amount: Payment + GST adjustments
     pivot_df['Final Paid Amount'] = pivot_df['Payment Amount'] + pivot_df['GST Adjustment']
 
     # Display TDS as absolute value ONLY in the summary output
@@ -166,13 +201,13 @@ if uploaded_pdf:
     # ============== Optional Import Name enrichment ==============
     st.markdown("---")
     st.subheader("Optional: Add Import Name (via Ledger & State mapping)")
-    want_import = st.checkbox("Add 'Import Name' column using E‑Invoice Ledger and State Details?")
+    want_import = st.checkbox("Add 'Import Name' column using E-Invoice Ledger and State Details?")
 
     enriched_df = pivot_df.copy()
 
     if want_import:
         ledger_file = st.file_uploader(
-            "Upload E‑Invoice Ledger Report (must include 'Invoice Number' and 'Ship To (State)')",
+            "Upload E-Invoice Ledger Report (must include 'Invoice Number' and 'Ship To (State)')",
             type=["xlsx", "xls", "csv"], key="ledger"
         )
         state_map_file = st.file_uploader(
@@ -181,11 +216,9 @@ if uploaded_pdf:
         )
 
         if ledger_file and state_map_file:
-            # Read both tables
             ledger_df = read_table(ledger_file)
             state_df = read_table(state_map_file)
 
-            # Validate columns
             ledger_required = {'Invoice Number', 'Ship To (State)'}
             state_required = {'STATE NAME', 'IMPORT NAME'}
             missing_ledger = ledger_required - set(ledger_df.columns)
@@ -196,7 +229,6 @@ if uploaded_pdf:
             elif missing_state:
                 st.error(f"State Details file is missing columns: {missing_state}")
             else:
-                # Normalize columns for joining
                 ledger_df = ledger_df.copy()
                 ledger_df['__INV_JOIN__'] = ledger_df['Invoice Number'].map(normalize_invoice)
                 ledger_df['__STATE_JOIN__'] = ledger_df['Ship To (State)'].map(normalize_state)
@@ -208,7 +240,6 @@ if uploaded_pdf:
                 enriched_df = enriched_df.copy()
                 enriched_df['__INV_JOIN__'] = enriched_df['Invoice Number'].map(normalize_invoice)
 
-                # Join 1: Invoice → State
                 tmp = pd.merge(
                     enriched_df,
                     ledger_df[['__INV_JOIN__', '__STATE_JOIN__']].drop_duplicates(),
@@ -216,7 +247,6 @@ if uploaded_pdf:
                     how='left'
                 )
 
-                # Join 2: State → Import Name
                 tmp = pd.merge(
                     tmp,
                     state_df,
@@ -224,32 +254,24 @@ if uploaded_pdf:
                     how='left'
                 )
 
-                # Finalize
                 tmp.rename(columns={'IMPORT NAME': 'Import Name'}, inplace=True)
                 tmp.drop(columns=['__INV_JOIN__', '__STATE_JOIN__'], inplace=True)
 
-                # Place 'Import Name' right after 'Invoice Number'
                 cols_with_import = ['Invoice Number', 'Import Name'] + [c for c in base_cols if c != 'Invoice Number']
-                # Ensure no duplicates and keep existing if any collisions
                 cols_with_import = [c for i, c in enumerate(cols_with_import) if c not in cols_with_import[:i]]
                 enriched_df = tmp[cols_with_import]
 
-                # Basic diagnostics
                 matched = enriched_df['Import Name'].notna().sum()
                 total = len(enriched_df)
                 st.info(f"Matched Import Name for {matched} of {total} invoices.")
-
-                # Show enriched table
                 st.success("✅ Final Invoice Summary (with Import Name)")
                 st.dataframe(enriched_df)
 
     # ============================ Export ============================
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # If we enriched, write enriched_df; else write pivot_df
         (enriched_df if want_import and 'Import Name' in enriched_df.columns else pivot_df)\
             .to_excel(writer, sheet_name='Final Summary', index=False)
-        # Raw Data for audit (with signed TDS)
         df_all.to_excel(writer, sheet_name='Raw Data', index=False)
     output.seek(0)
 
